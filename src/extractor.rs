@@ -17,8 +17,9 @@ use futures::StreamExt;
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Fetches a course page and extracts all schema fields via a 3-layer pipeline:
+///   Layer 0 — Full-text regex extraction (most reliable)
 ///   Layer 1 — JSON-LD structured data (zero fragile selectors)
-///   Layer 2 — HTML CSS selectors (fills gaps left by Layer 1)
+///   Layer 2 — HTML CSS selectors (fills gaps left by other layers)
 ///   Layer 3 — Headless Chrome (JS-rendered content, optional feature flag)
 pub async fn extract_course(client: &Client, url: &str) -> CourseData {
     info!("Extracting: {}", url);
@@ -32,6 +33,12 @@ pub async fn extract_course(client: &Client, url: &str) -> CourseData {
     match fetch_with_retry(client, url).await {
         Ok(html) => {
             let doc = Html::parse_document(&html);
+            
+            // ─── LAYER 0: Full-text extraction (CRITICAL - most reliable) ─────
+            let full_text = doc.root_element().text().collect::<Vec<_>>().join(" ");
+            layer0_full_text(&full_text, &doc, &mut data);
+            
+            // ─── LAYER 1: JSON-LD ────────────────────────────────────────────
             layer1_json_ld(&doc, &mut data);
 
             if data.study_level == NA {
@@ -40,6 +47,7 @@ pub async fn extract_course(client: &Client, url: &str) -> CourseData {
                 }
             }
 
+            // ─── LAYER 2: HTML selectors (now as fallback only) ──────────────
             layer2_selectors(&doc, &mut data);
         }
         Err(e) => warn!("HTTP fetch failed for {}: {}", url, e),
@@ -58,6 +66,425 @@ pub async fn extract_course(client: &Client, url: &str) -> CourseData {
     }
 
     data
+}
+
+// ─── LAYER 0: Full-text extraction ───────────────────────────────────────────
+
+fn layer0_full_text(full_text: &str, doc: &Html, data: &mut CourseData) {
+    let text_lower = full_text.to_lowercase();
+    
+    // ── IELTS ────────────────────────────────────────────────────────────────
+    set_if_na(&mut data.min_ielts, || {
+        let re = Regex::new(r"(?i)ielts[^0-9]{0,30}(\d\.\d)").unwrap();
+        re.captures(full_text)
+            .map(|c| c[1].to_string())
+            .filter(|s| {
+                if let Ok(n) = s.parse::<f32>() {
+                    n >= 4.0 && n <= 9.0
+                } else {
+                    false
+                }
+            })
+    });
+    
+    // ── PTE (FIXED: validates score range 36-90) ─────────────────────────────
+    set_if_na(&mut data.min_pte, || {
+        let re = Regex::new(r"(?i)PTE(?:\s+Academic)?[^0-9]{0,30}(\d{2,3})").unwrap();
+        for cap in re.captures_iter(full_text) {
+            let score_str = &cap[1];
+            if let Ok(score) = score_str.parse::<u32>() {
+                // Valid PTE scores are typically 36-90
+                if score >= 36 && score <= 90 {
+                    return Some(score_str.to_string());
+                }
+            }
+        }
+        None
+    });
+    
+    // ── TOEFL ────────────────────────────────────────────────────────────────
+    set_if_na(&mut data.min_toefl, || {
+        let re = Regex::new(r"(?i)TOEFL(?:\s+iBT)?[^0-9]{0,30}(\d{2,3})").unwrap();
+        for cap in re.captures_iter(full_text) {
+            let score_str = &cap[1];
+            if let Ok(score) = score_str.parse::<u32>() {
+                if score >= 60 && score <= 120 {
+                    return Some(score_str.to_string());
+                }
+            }
+        }
+        None
+    });
+    
+    // ── Duolingo ─────────────────────────────────────────────────────────────
+    set_if_na(&mut data.min_duolingo, || {
+        let re = Regex::new(r"(?i)duolingo[^0-9]{0,30}(\d{2,3})").unwrap();
+        for cap in re.captures_iter(full_text) {
+            let score_str = &cap[1];
+            if let Ok(score) = score_str.parse::<u32>() {
+                if score >= 80 && score <= 160 {
+                    return Some(score_str.to_string());
+                }
+            }
+        }
+        None
+    });
+    
+    // ── Kaplan ───────────────────────────────────────────────────────────────
+    set_if_na(&mut data.kaplan_test_of_english, || {
+        let re = Regex::new(r"(?i)kaplan[^0-9]{0,30}(\d{2,3})").unwrap();
+        for cap in re.captures_iter(full_text) {
+            let score_str = &cap[1];
+            if let Ok(score) = score_str.parse::<u32>() {
+                if score >= 300 && score <= 700 {
+                    return Some(score_str.to_string());
+                }
+            }
+        }
+        None
+    });
+    
+    // ── Duration ─────────────────────────────────────────────────────────────
+    set_if_na(&mut data.course_duration, || {
+        let patterns = [
+            r"(?i)(\d+)\s*years?(?:\s*full[-\s]time)?",
+            r"(?i)(\d+)\s*months?",
+        ];
+        for pat in &patterns {
+            if let Ok(re) = Regex::new(pat) {
+                if let Some(cap) = re.captures(full_text) {
+                    return Some(cap[0].trim().to_string());
+                }
+            }
+        }
+        None
+    });
+    
+    // ── Intakes (FIXED: filter valid future years only) ──────────────────────
+    set_if_na(&mut data.all_intakes_available, || {
+        let re = Regex::new(r"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})").unwrap();
+        let current_year = 2025; // Minimum valid year
+        let mut intakes: Vec<String> = Vec::new();
+        
+        for cap in re.captures_iter(full_text) {
+            let month = &cap[1];
+            let year_str = &cap[2];
+            if let Ok(year) = year_str.parse::<i32>() {
+                // Only keep years >= current_year
+                if year >= current_year {
+                    intakes.push(format!("{} {}", month, year));
+                }
+            }
+        }
+        
+        intakes.sort();
+        intakes.dedup();
+        
+        if !intakes.is_empty() {
+            Some(intakes.join(", "))
+        } else {
+            None
+        }
+    });
+    
+    // ── Work Experience (FIXED: keyword validation) ──────────────────────────
+    set_if_na(&mut data.mandatory_work_exp, || {
+        let patterns = [
+            r"(?i)(?:\d+\+?\s*years?(?:\s+of)?\s+(?:relevant\s+)?(?:work\s+)?experience[^.]{0,80})",
+            r"(?i)work\s+experience[^.]{0,80}\d+\s*years?",
+        ];
+        for pat in &patterns {
+            if let Ok(re) = Regex::new(pat) {
+                if let Some(cap) = re.find(full_text) {
+                    let text = cap.as_str().trim().to_string();
+                    let lower = text.to_lowercase();
+                    if lower.contains("year") && lower.contains("experience") {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+        None
+    });
+    
+    // ── Mandatory Documents (FIXED: separate from academic requirements) ─────
+    set_if_na(&mut data.mandatory_documents_required, || {
+        if let Some(section) = extract_section_by_heading(doc, &["entry requirements", "requirements"]) {
+            let lower = section.to_lowercase();
+            
+            // Skip if it's primarily about English requirements
+            if lower.contains("ielts") && !lower.contains("transcript") && 
+               !lower.contains("certificate") && !lower.contains("reference") {
+                return None;
+            }
+            
+            // Look for actual document mentions
+            let doc_keywords = ["transcript", "certificate", "reference", "statement", 
+                               "cv", "curriculum vitae", "passport", "visa", "portfolio",
+                               "personal statement", "letter of recommendation"];
+            
+            let has_documents = doc_keywords.iter().any(|kw| lower.contains(kw));
+            
+            if has_documents {
+                // Extract only the document-related parts
+                let mut doc_text = String::new();
+                for kw in doc_keywords {
+                    let pattern = format!(r"(?i)[^.]*{}[^.]*\.", regex::escape(kw));
+                    if let Ok(re) = Regex::new(&pattern) {
+                        if let Some(cap) = re.find(&section) {
+                            doc_text.push_str(cap.as_str().trim());
+                            doc_text.push(' ');
+                        }
+                    }
+                }
+                
+                let trimmed = doc_text.trim().to_string();
+                if trimmed.len() > 30 {
+                    return Some(trimmed.chars().take(500).collect());
+                }
+            }
+            
+            // If section mentions degree but no documents, don't use it
+            if lower.contains("degree") || lower.contains("honours") || lower.contains("2:") {
+                if !has_documents {
+                    return None;
+                }
+            }
+        }
+        None
+    });
+    
+    // ── Class 12 Boards Accepted (FIXED: education keyword filtering) ────────
+    set_if_na(&mut data.class_12_boards_accepted, || {
+        if let Some(section) = extract_section_by_heading(doc, &["entry requirements", "academic requirements"]) {
+            let lower = section.to_lowercase();
+            
+            // Skip if it's just English requirements
+            if lower.contains("ielts") && section.len() < 200 {
+                return None;
+            }
+            
+            if lower.contains("a-level") || lower.contains("ib") || 
+               lower.contains("btec") || lower.contains("gcse") ||
+               lower.contains("12th") || lower.contains("board") ||
+               lower.contains("high school") || lower.contains("secondary") {
+                let cleaned = section
+                    .replace("Typical entry requirements:", "")
+                    .replace("Entry requirements", "")
+                    .trim()
+                    .to_string();
+                if cleaned.len() > 30 {
+                    return Some(cleaned.chars().take(400).collect());
+                }
+            }
+        }
+        None
+    });
+    
+    // ── UG Academic Requirement (FIXED: degree keyword filtering) ────────────
+    set_if_na(&mut data.ug_academic_min_gpa, || {
+        let patterns = [
+            r"(?i)(?:2:[12]|first|upper\s+second|lower\s+second)[^.]{0,100}(?:honours|degree|classification)",
+            r"(?i)(?:minimum|required|equivalent)[^.]{0,50}(?:degree|honours|gpa)[^.]{0,50}",
+        ];
+        for pat in &patterns {
+            if let Ok(re) = Regex::new(pat) {
+                if let Some(cap) = re.find(full_text) {
+                    let text = cap.as_str().trim().to_string();
+                    let lower = text.to_lowercase();
+                    if lower.contains("degree") || lower.contains("honours") || 
+                       lower.contains("gpa") || lower.contains("classification") ||
+                       lower.contains("bachelor") || lower.contains("equivalent") {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+        None
+    });
+    
+    // ── 12th Grade Minimum (FIXED: A-level/GCSE keyword filtering) ───────────
+    set_if_na(&mut data.twelfth_pass_min_cgpa, || {
+        if let Some(section) = extract_section_by_heading(doc, &["entry requirements", "academic requirements"]) {
+            let lower = section.to_lowercase();
+            
+            // Skip if it's just English requirements
+            if lower.contains("ielts") && section.len() < 200 {
+                return None;
+            }
+            
+            if lower.contains("a-level") || lower.contains("a level") || 
+               lower.contains("gcse") || lower.contains("12th") || 
+               lower.contains("grade 12") || lower.contains("high school") {
+                let patterns = [
+                    r"(?i)A[- ]level[^.]{0,150}",
+                    r"(?i)GCSE[^.]{0,100}",
+                    r"(?i)(?:12th|grade\s*12|high\s+school)[^.]{0,100}",
+                ];
+                for pat in &patterns {
+                    if let Ok(re) = Regex::new(pat) {
+                        if let Some(cap) = re.find(&section) {
+                            let text = cap.as_str().trim().to_string();
+                            if text.len() > 15 {
+                                return Some(text.chars().take(300).collect());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    });
+    
+    // ── English Waiver - Medium of Instruction ───────────────────────────────
+    set_if_na(&mut data.english_waiver_moi, || {
+        if text_lower.contains("medium of instruction") || 
+           text_lower.contains("english taught") ||
+           text_lower.contains("taught in english") ||
+           text_lower.contains("english as the medium") {
+            Some("May be waived if previous study was conducted in English".to_string())
+        } else {
+            None
+        }
+    });
+    
+    // ── English Waiver - Class 12 ────────────────────────────────────────────
+    set_if_na(&mut data.english_waiver_class12, || {
+        if text_lower.contains("english at gcse")
+            || text_lower.contains("english language gcse")
+            || text_lower.contains("grade c in english")
+            || text_lower.contains("grade 4 in english")
+            || text_lower.contains("english gcse")
+            || text_lower.contains("gcse english")
+        {
+            Some("English at GCSE grade C/4 or equivalent may satisfy the requirement".to_string())
+        } else {
+            None
+        }
+    });
+    
+    // ── Campus (FIXED: default to Coventry for most courses) ─────────────────
+    set_if_na(&mut data.campus, || {
+        if text_lower.contains("coventry campus") || 
+           text_lower.contains("coventry university campus") ||
+           text_lower.contains("main campus") {
+            Some("Coventry".to_string())
+        } else if text_lower.contains("london campus") || 
+                  text_lower.contains("coventry university london") {
+            Some("London".to_string())
+        } else if text_lower.contains("scarborough campus") {
+            Some("Scarborough".to_string())
+        } else if text_lower.contains("campus:") {
+            // Try to extract campus name from "Campus: XXX" pattern
+            let re = Regex::new(r"(?i)campus\s*[:]\s*([^.,\n]+)").unwrap();
+            re.captures(full_text)
+                .map(|c| c[1].trim().to_string())
+                .filter(|s| !s.is_empty() && s.len() < 30)
+        } else {
+            // Default to Coventry for most courses
+            Some("Coventry".to_string())
+        }
+    });
+    
+    // ── GRE/GMAT (FIXED: strict keyword validation - no pollution) ──────────
+    set_if_na(&mut data.gre_gmat_mandatory_min_score, || {
+        // Only proceed if GRE or GMAT is actually mentioned in a meaningful context
+        if text_lower.contains("gre") || text_lower.contains("gmat") {
+            // Look for "required", "minimum", "score" nearby
+            let re = Regex::new(r"(?i)(?:GRE|GMAT)[^.]{0,80}(?:required|minimum|score|expected)").unwrap();
+            if let Some(cap) = re.find(full_text) {
+                let text = cap.as_str().trim().to_string();
+                // Verify it's actually about test scores, not navigation/footer
+                let lower = text.to_lowercase();
+                if (lower.contains("gre") || lower.contains("gmat")) && 
+                   (lower.contains("required") || lower.contains("score") || 
+                    lower.contains("minimum") || lower.contains("recommended")) &&
+                   !lower.contains("research") && !lower.contains("global") &&
+                   !lower.contains("useful links") && !lower.contains("explore") {
+                    return Some(text);
+                }
+            }
+        }
+        None
+    });
+    
+    // ── Max Backlogs ─────────────────────────────────────────────────────────
+    set_if_na(&mut data.max_backlogs, || {
+        if text_lower.contains("backlog") || text_lower.contains("arrears") {
+            let re = Regex::new(r"(?i)(?:backlog|arrears?)[^.]{0,80}").unwrap();
+            re.find(full_text).map(|m| m.as_str().trim().to_string())
+        } else {
+            None
+        }
+    });
+    
+    // ── Gap Year ─────────────────────────────────────────────────────────────
+    set_if_na(&mut data.gap_year_max_accepted, || {
+        if text_lower.contains("gap year") {
+            let re = Regex::new(r"(?i)gap year[^.]*?(\d+)").unwrap();
+            if let Some(cap) = re.captures(full_text) {
+                return Some(cap[1].to_string());
+            }
+            Some("Permitted — see entry requirements".to_string())
+        } else {
+            None
+        }
+    });
+}
+
+/// Extracts text content following a heading that contains any of the given keywords
+/// FIXED: Properly walks sibling elements to get content AFTER heading
+fn extract_section_by_heading(doc: &Html, heading_keywords: &[&str]) -> Option<String> {
+    let heading_sel = Selector::parse("h1, h2, h3, h4, h5, h6, .c-tab__heading, .accordion__heading, .c-tab__title, .c-accordion__title").unwrap();
+    
+    for heading in doc.select(&heading_sel) {
+        let heading_text = heading.text().collect::<String>().to_lowercase();
+        
+        if heading_keywords.iter().any(|kw| heading_text.contains(kw)) {
+            // Walk through siblings after the heading
+            let mut content = String::new();
+            let mut current = heading.next_sibling_element();
+            let mut count = 0;
+            
+            while let Some(el) = current {
+                count += 1;
+                if count > 15 { break; } // Limit how far we go
+                
+                let name = el.value().name();
+                // Stop if we hit another heading (h1-h6)
+                if name.starts_with('h') && name.len() == 2 {
+                    if let Ok(num) = name[1..].parse::<u32>() {
+                        if num >= 1 && num <= 6 {
+                            break;
+                        }
+                    }
+                }
+                // Also stop at major section containers
+                if name == "section" || name == "div" {
+                    if let Some(class) = el.value().attr("class") {
+                        if class.contains("tab") || class.contains("accordion") {
+                            break;
+                        }
+                    }
+                }
+                
+                // Get text from this element
+                let el_text = el.text().collect::<String>();
+                if !el_text.trim().is_empty() {
+                    content.push_str(&el_text);
+                    content.push(' ');
+                }
+                
+                current = el.next_sibling_element();
+            }
+            
+            let trimmed = content.trim().to_string();
+            if trimmed.len() > 30 {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
 }
 
 // ─── Layer 1: JSON-LD ─────────────────────────────────────────────────────────
@@ -133,15 +560,13 @@ fn parse_json_ld_course(obj: &Value, data: &mut CourseData) {
     });
 }
 
-// ─── Layer 2: HTML selectors ──────────────────────────────────────────────────
+// ─── Layer 2: HTML selectors (now as fallback) ────────────────────────────────
 
 fn layer2_selectors(doc: &Html, data: &mut CourseData) {
-    // Scope all text extraction to the main content area to avoid
-    // false positives from nav, footer, and cookie banners
     let content_text = main_content_text(doc);
     let content_lower = content_text.to_lowercase();
 
-    // ── Program name ──────────────────────────────────────────────────────────
+    // Program name
     set_if_na(&mut data.program_course_name, || {
         first_text(
             doc,
@@ -155,33 +580,21 @@ fn layer2_selectors(doc: &Html, data: &mut CourseData) {
         )
     });
 
-    // ── Study level ───────────────────────────────────────────────────────────
+    // Study level from breadcrumb
     set_if_na(&mut data.study_level, || {
         first_text(
             doc,
             &[
-                // Coventry uses breadcrumb second item for level
                 "nav[aria-label='breadcrumb'] li:nth-child(2)",
                 ".breadcrumb li:nth-child(2)",
                 "ol.breadcrumb li:nth-child(2)",
                 ".c-breadcrumb__item:nth-child(2)",
-                "[data-study-level]",
-                ".course-level",
-                ".study-level",
             ],
         )
     });
 
-    // ── Course duration ───────────────────────────────────────────────────────
-    set_if_na(&mut data.course_duration, || {
-        let v = find_labeled_value(doc, &["Duration", "Course length", "Length", "Study mode"]);
-        if v != NA { Some(v) } else { None }
-    });
-
-    // ── Tuition fee ───────────────────────────────────────────────────────────
-    // Coventry uses a key-info strip with labels like "UK fee" / "International fee"
+    // Tuition fee from key-info strip
     set_if_na(&mut data.yearly_tuition_fee, || {
-        // Try international fee first (most relevant for overseas applicants)
         for label in &[
             "International fee",
             "International tuition fee",
@@ -196,158 +609,11 @@ fn layer2_selectors(doc: &Html, data: &mut CourseData) {
                 return Some(v.replace("per year", "").replace("Per year", "").trim().to_string());
             }
         }
-        // Fallback: look for a £ or GBP amount in the key info area
         extract_fee_from_content(doc)
     });
 
-    // ── Intakes / start dates ─────────────────────────────────────────────────
-    set_if_na(&mut data.all_intakes_available, || {
-        let v = find_labeled_value(
-            doc,
-            &["Start date", "Start dates", "Entry point", "Entry", "Intake", "When can I start"],
-        );
-        if v != NA { Some(v) } else { None }
-    });
-
-    // ── Campus ────────────────────────────────────────────────────────────────
-    set_if_na(&mut data.campus, || {
-        let v = find_labeled_value(doc, &["Campus", "Location", "Study location", "Where"]);
-        if v != NA { Some(v) } else { None }
-    });
-
-    // ── English proficiency scores ────────────────────────────────────────────
-    // Uses regex patterns to extract numeric scores robustly.
-    // Example patterns handled:
-    //   "IELTS overall score of 6.5"  → "6.5"
-    //   "minimum IELTS 6.0"           → "6.0"
-    //   "PTE Academic 54"             → "54"
-    //   "TOEFL iBT 79"                → "79"
-    set_if_na(&mut data.min_ielts,   || extract_test_score(&content_text, &["IELTS"]));
-    set_if_na(&mut data.min_pte,     || extract_test_score(&content_text, &["PTE Academic", "PTE"]));
-    set_if_na(&mut data.min_toefl,   || extract_test_score(&content_text, &["TOEFL iBT", "TOEFL"]));
-    set_if_na(&mut data.min_duolingo, || extract_test_score(&content_text, &["Duolingo English Test", "Duolingo", "DET"]));
-    set_if_na(&mut data.kaplan_test_of_english, || extract_test_score(&content_text, &["Kaplan Test of English", "Kaplan"]));
-    set_if_na(&mut data.gre_gmat_mandatory_min_score, || {
-        // GRE/GMAT scores are rarely required at Coventry — check for explicit mention
-        let has_gre  = content_lower.contains("gre") && content_lower.contains("required");
-        let has_gmat = content_lower.contains("gmat") && content_lower.contains("required");
-        if has_gre || has_gmat {
-            extract_test_score(&content_text, &["GRE", "GMAT"])
-        } else {
-            None
-        }
-    });
-
-    // ── Entry requirements / mandatory documents ──────────────────────────────
-    // Coventry's entry requirements live in a tab panel — try multiple selectors
-    set_if_na(&mut data.mandatory_documents_required, || {
-        text_from_selectors(
-            doc,
-            &[
-                // Coventry-specific tab/section IDs
-                "#entry-requirements",
-                "[data-tab='entry-requirements']",
-                "#tab-entry-requirements",
-                ".entry-requirements__content",
-                // Generic fallbacks
-                ".entry-requirements",
-                ".requirements-section",
-                ".c-entry-requirements",
-            ],
-            500,
-        )
-    });
-
-    // ── Class 12 / A-level / IB accepted qualifications ──────────────────────
-    set_if_na(&mut data.class_12_boards_accepted, || {
-        let block = text_from_selectors(
-            doc,
-            &[
-                "#entry-requirements",
-                ".entry-requirements",
-                ".entry-requirements__content",
-                "#tab-entry-requirements",
-            ],
-            2000,
-        )?;
-        // Keep only sentences mentioning recognised pre-university qualifications
-        let relevant: String = block
-            .split('.')
-            .filter(|s| {
-                let l = s.to_lowercase();
-                l.contains("a-level")
-                    || l.contains("a level")
-                    || l.contains("ib diploma")
-                    || l.contains("international baccalaureate")
-                    || l.contains("btec")
-                    || l.contains("gcse")
-                    || l.contains("12th")
-                    || l.contains("high school")
-                    || l.contains("secondary school")
-                    || l.contains("qualification")
-                    || l.contains("grade")
-            })
-            .collect::<Vec<_>>()
-            .join(". ")
-            .trim()
-            .to_string();
-        if relevant.is_empty() { None } else { Some(relevant) }
-    });
-
-    // ── UG academic grade requirement ─────────────────────────────────────────
-    set_if_na(&mut data.ug_academic_min_gpa, || {
-        let v = find_labeled_value(
-            doc,
-            &[
-                "Degree classification",
-                "Minimum grade",
-                "GPA",
-                "Academic requirement",
-                "Honours degree",
-            ],
-        );
-        if v != NA { Some(v) } else { None }
-    });
-
-    // ── 12th grade minimum ────────────────────────────────────────────────────
-    set_if_na(&mut data.twelfth_pass_min_cgpa, || {
-        let v = find_labeled_value(
-            doc,
-            &["A-level", "A level", "GCSE", "12th", "Twelfth", "High school grade"],
-        );
-        if v != NA { Some(v) } else { None }
-    });
-
-    // ── Work experience ───────────────────────────────────────────────────────
-    set_if_na(&mut data.mandatory_work_exp, || {
-        let v = find_labeled_value(
-            doc,
-            &[
-                "Work experience",
-                "Professional experience",
-                "Industry experience",
-                "Relevant experience",
-            ],
-        );
-        if v != NA {
-            return Some(v);
-        }
-        // Regex: "X year(s)' experience" / "X years of experience"
-        let re = Regex::new(r"(?i)\d+\s+years?['\s]+(?:of\s+)?(?:relevant\s+)?(?:professional\s+)?experience")
-            .unwrap();
-        re.find(&content_text)
-            .map(|m| m.as_str().trim().to_string())
-    });
-
-    // ── Max backlogs ──────────────────────────────────────────────────────────
-    set_if_na(&mut data.max_backlogs, || {
-        let v = find_labeled_value(doc, &["Backlog", "Backlogs", "Arrears", "Standing arrears"]);
-        if v != NA { Some(v) } else { None }
-    });
-
-    // ── Scholarship ───────────────────────────────────────────────────────────
+    // Scholarship
     set_if_na(&mut data.scholarship_availability, || {
-        // Check for a dedicated scholarships section
         let from_sel = text_from_selectors(
             doc,
             &[
@@ -363,7 +629,6 @@ fn layer2_selectors(doc: &Html, data: &mut CourseData) {
         if from_sel.is_some() {
             return from_sel;
         }
-        // Check for a scholarships link or mention
         if let Ok(sel) = Selector::parse("a[href*='scholarship'], a[href*='bursary'], a[href*='funding']") {
             if doc.select(&sel).next().is_some() {
                 return Some("Scholarships available (see course page)".to_string());
@@ -376,52 +641,7 @@ fn layer2_selectors(doc: &Html, data: &mut CourseData) {
         }
     });
 
-    // ── English waivers ───────────────────────────────────────────────────────
-    set_if_na(&mut data.english_waiver_moi, || {
-        if content_lower.contains("medium of instruction")
-            || content_lower.contains("english-taught")
-            || content_lower.contains("taught in english")
-            || content_lower.contains("english taught")
-            || content_lower.contains("exempt if")
-        {
-            Some(
-                "May be waived if previous study was conducted in English — see course page"
-                    .to_string(),
-            )
-        } else {
-            None
-        }
-    });
-
-    set_if_na(&mut data.english_waiver_class12, || {
-        if content_lower.contains("english at gcse")
-            || content_lower.contains("english language gcse")
-            || content_lower.contains("grade c in english")
-            || content_lower.contains("grade 4 in english")
-            || content_lower.contains("english gcse")
-        {
-            Some(
-                "English at GCSE grade C/4 or equivalent may satisfy the requirement".to_string(),
-            )
-        } else {
-            None
-        }
-    });
-
-    // ── Gap year ──────────────────────────────────────────────────────────────
-    set_if_na(&mut data.gap_year_max_accepted, || {
-        if content_lower.contains("gap year") {
-            let re = Regex::new(r"(?i)gap year[^.]*?(\d+)").unwrap();
-            if let Some(cap) = re.captures(&content_text) {
-                return Some(cap[1].to_string());
-            }
-            Some("Permitted — see entry requirements".to_string())
-        } else {
-            None
-        }
-    });
-
-    // ── Indian regional institution restrictions ──────────────────────────────
+    // Indian restrictions
     set_if_na(&mut data.indian_regional_institution_restrictions, || {
         if content_lower.contains("india") || content_lower.contains("indian") {
             let re = Regex::new(r"(?i)(?:india[^\.\n]*?(?:university|institution|college|board)[^\.\n]*\.)")
@@ -462,7 +682,6 @@ async fn layer3_chromium(url: &str, data: &mut CourseData) -> Result<()> {
     });
 
     let page = browser.new_page(url).await?;
-    // Wait for JS-rendered content to settle
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     let html = page.content().await?;
@@ -470,6 +689,8 @@ async fn layer3_chromium(url: &str, data: &mut CourseData) -> Result<()> {
     handler_task.abort();
 
     let doc = Html::parse_document(&html);
+    let full_text = doc.root_element().text().collect::<Vec<_>>().join(" ");
+    layer0_full_text(&full_text, &doc, data);
     layer2_selectors(&doc, data);
 
     Ok(())
@@ -492,56 +713,10 @@ fn find_chrome() -> Option<std::path::PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
-// ─── Score extraction (regex-based) ──────────────────────────────────────────
-
-/// Extracts a numeric proficiency score that follows a test keyword.
-///
-/// Handles patterns such as:
-///   "IELTS overall score of 6.5"    → "6.5"
-///   "minimum IELTS 6.0"             → "6.0"
-///   "PTE Academic: 54"              → "54"
-///   "TOEFL iBT score: 79"           → "79"
-///
-/// The regex requires the score to look like a plausible test score (1-3 digits,
-/// optional single decimal place) and NOT be a 4-digit year (≥ 1900), which
-/// previously caused `min_pte` to capture page year values like "2025".
-fn extract_test_score(text: &str, keywords: &[&str]) -> Option<String> {
-    for keyword in keywords {
-        let escaped = regex::escape(keyword);
-        // Pattern: keyword, optional filler text, then a 1-3 digit number (possibly with one decimal)
-        let pattern = format!(r"(?i){}\s*[:]?\s*(?:of\s+)?(?:score\s+)?(\d{{1,3}}(?:\.\d)?)", escaped);
-        if let Ok(re) = Regex::new(&pattern) {
-            if let Some(cap) = re.captures(text) {
-                let score = &cap[1];
-                // Sanity-check: reject 4-digit numbers (years) and implausibly large scores
-                if score.len() <= 3 {
-                    return Some(score.to_string());
-                }
-            }
-        }
-    }
-    
-    // Fallback: simple keyword-find, then take the next short number
-    for keyword in keywords {
-        if let Some(pos) = text.to_lowercase().find(&keyword.to_lowercase()) {
-            let after = &text[pos + keyword.len()..];
-            let window: String = after.chars().take(60).collect();
-            let re = Regex::new(r"\b(\d{1,3}(?:\.\d)?)\b").unwrap();
-            if let Some(cap) = re.captures(&window) {
-                let score = &cap[1];
-                if score.len() <= 3 {
-                    return Some(score.to_string());
-                }
-            }
-        }
-    }
-    None
-}
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Looks for a fee amount (£ or GBP) in the key-info strip.
-/// Returns the first plausible fee string found.
 fn extract_fee_from_content(doc: &Html) -> Option<String> {
-    // Coventry key-info selectors
     for sel_str in &[
         ".c-key-info__value",
         ".key-info__value",
@@ -560,15 +735,11 @@ fn extract_fee_from_content(doc: &Html) -> Option<String> {
             }
         }
     }
-    // Regex fallback: find "£XX,XXX" or "GBP XXXXX" anywhere in the page
     let body_text: String = doc.root_element().text().collect();
-    let re = Regex::new(r"£\s*[\d,]+(?:\s*per\s+year)?|GBP\s*[\d,]+").unwrap();
+    let re = Regex::new(r"£\s*[\d,]+(?:\s*per\s+year)?").unwrap();
     re.find(&body_text).map(|m| m.as_str().trim().to_string())
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Sets a field only if it is currently `NA`, using the provided closure.
 #[inline]
 fn set_if_na(field: &mut String, f: impl FnOnce() -> Option<String>) {
     if field.as_str() == NA {
@@ -582,8 +753,6 @@ fn set_if_na(field: &mut String, f: impl FnOnce() -> Option<String>) {
 }
 
 /// Extracts text from the page's primary content container.
-/// Scoping to `<main>` prevents nav/footer/cookie-banner text from creating
-/// false positives in score and keyword extraction.
 fn main_content_text(doc: &Html) -> String {
     let sel = Selector::parse("main, #main-content, .main-content, article, #content")
         .unwrap_or_else(|_| Selector::parse("body").unwrap());
@@ -593,7 +762,6 @@ fn main_content_text(doc: &Html) -> String {
         .unwrap_or_else(|| doc.root_element().text().collect::<Vec<_>>().join(" "))
 }
 
-/// Derives study level from the URL path — free, before any network request.
 fn study_level_from_url(url: &str) -> Option<String> {
     let lower = url.to_lowercase();
     if lower.contains("/course-structure/ug/") || lower.contains("/courses/undergraduate/") {
@@ -607,7 +775,6 @@ fn study_level_from_url(url: &str) -> Option<String> {
     }
 }
 
-/// Derives study level from page content when the URL doesn't make it clear.
 fn study_level_from_content(doc: &Html) -> Option<String> {
     for sel_str in &[
         "nav[aria-label='breadcrumb'] li",
@@ -653,8 +820,6 @@ fn study_level_from_content(doc: &Html) -> Option<String> {
     None
 }
 
-/// Returns `true` when enough critical fields are still `NA` to justify a
-/// Layer 3 JS render attempt.
 fn needs_js_render(data: &CourseData) -> bool {
     [
         &data.program_course_name,
@@ -666,11 +831,9 @@ fn needs_js_render(data: &CourseData) -> bool {
     ]
     .iter()
     .filter(|f| f.as_str() == NA)
-    .count()
-        >= 3
+    .count() >= 3
 }
 
-/// Tries each selector string in order; returns the trimmed text of the first match.
 fn first_text(doc: &Html, selectors: &[&str]) -> Option<String> {
     for sel_str in selectors {
         if let Ok(sel) = Selector::parse(sel_str) {
@@ -685,7 +848,6 @@ fn first_text(doc: &Html, selectors: &[&str]) -> Option<String> {
     None
 }
 
-/// Collects text from the first matching selector, truncated to `max_chars`.
 fn text_from_selectors(doc: &Html, selectors: &[&str], max_chars: usize) -> Option<String> {
     for sel_str in selectors {
         if let Ok(sel) = Selector::parse(sel_str) {
@@ -704,10 +866,6 @@ fn text_from_selectors(doc: &Html, selectors: &[&str], max_chars: usize) -> Opti
     None
 }
 
-/// Searches for a label-value pair using three HTML patterns:
-///   1. `<dt>Label</dt><dd>Value</dd>`
-///   2. `.label-class` + sibling `.value-class`
-///   3. Any element whose visible text starts with "Label: value"
 fn find_labeled_value(doc: &Html, labels: &[&str]) -> String {
     // Pattern 1: definition list
     if let Ok(dt_sel) = Selector::parse("dt") {
@@ -743,7 +901,6 @@ fn find_labeled_value(doc: &Html, labels: &[&str]) -> String {
                     .iter()
                     .any(|l| text.trim().to_lowercase().contains(&l.to_lowercase()))
                 {
-                    // Try next sibling with Coventry-specific value classes
                     if let Some(sibling) = el.next_sibling_element() {
                         let val: String = sibling.text().collect::<String>().trim().to_string();
                         if !val.is_empty() {
@@ -776,7 +933,6 @@ fn find_labeled_value(doc: &Html, labels: &[&str]) -> String {
     NA.to_string()
 }
 
-/// Normalises whitespace in a string.
 fn clean(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
