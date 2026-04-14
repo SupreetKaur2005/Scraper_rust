@@ -132,7 +132,7 @@ Raw text is preserved where Coventry lists entry requirements as paragraphs rath
 
 ```bash
 # Navigate to the project directory
-cd coventry_scraper
+cd Scraper_rust
 
 # Build (first build downloads ~30 crates, ~1 min)
 cargo build --release
