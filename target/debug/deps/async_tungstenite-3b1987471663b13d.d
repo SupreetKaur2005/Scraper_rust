@@ -1,0 +1,10 @@
+C:\work\Scraper_rust\target\debug\deps\async_tungstenite-3b1987471663b13d.d: C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\lib.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\compat.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\handshake.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\async_std.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\tokio.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\tokio\dummy_tls.rs
+
+C:\work\Scraper_rust\target\debug\deps\libasync_tungstenite-3b1987471663b13d.rmeta: C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\lib.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\compat.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\handshake.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\async_std.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\tokio.rs C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\tokio\dummy_tls.rs
+
+C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\lib.rs:
+C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\compat.rs:
+C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\handshake.rs:
+C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\async_std.rs:
+C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\tokio.rs:
+C:\Users\hp\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\async-tungstenite-0.27.0\src\tokio\dummy_tls.rs:

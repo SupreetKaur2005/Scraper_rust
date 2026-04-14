@@ -1,0 +1,1 @@
+C:\work\Scraper_rust\target\release\coventry_scraper.exe: C:\work\Scraper_rust\src\extractor.rs C:\work\Scraper_rust\src\fetcher.rs C:\work\Scraper_rust\src\main.rs C:\work\Scraper_rust\src\schema.rs C:\work\Scraper_rust\src\sitemap.rs
