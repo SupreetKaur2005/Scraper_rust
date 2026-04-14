@@ -19,7 +19,7 @@ Most scrapers are written in Python with `requests` + `BeautifulSoup`. This impl
 The scraper runs a 4-stage pipeline:
 
 ```
-sitemap.rs → fetcher.rs → extractor.rs (3 layers) → output/courses.json
+sitemap.rs → fetcher.rs → extractor.rs (4 layers) → output/courses.json
 ```
 
 ### Stage 1 — URL Discovery (`sitemap.rs`)
@@ -28,36 +28,42 @@ Four strategies are tried in order; the first that returns results wins:
 
 | # | Strategy | Description |
 |---|----------|-------------|
-| 1 | **Sitemap XML** | Parses `sitemap_index.xml`, walks child sitemaps for `/course-structure/` URLs — the same source used by search engines |
-| 2 | **Search HTML** | Scrapes the search listing page (`/search/?contentType=NewCoursePage`) for course links |
+| 1 | **Sitemap XML** | Parses `sitemap_index.xml`, walks child sitemaps for `/course-structure/` URLs |
+| 2 | **Search HTML** | Scrapes the search listing page for course links |
 | 3 | **Homepage crawl** | Follows `/course-structure/` links found on the Coventry homepage |
-| 4 | **Verified fallback** | A hardcoded set of confirmed-working URLs (with `?term=` intake-year params), validated with HEAD requests before use |
+| 4 | **Verified fallback** | Hardcoded set of confirmed-working URLs, validated with HEAD requests |
 
-**Deduplication:** courses are deduplicated by their URL slug, so the same course does not appear twice when it is listed under multiple intake years (e.g. `?term=2025-26` and `?term=2026-27`).
+**Deduplication:** Courses are deduplicated by their URL slug, so the same course does not appear twice under multiple intake years.
 
 ### Stage 2 — Async HTTP (`fetcher.rs`)
 
 - Realistic browser headers (User-Agent, Accept-Language, etc.)
-- `robots.txt` compliance check on startup — correctly checks `/course-structure/` paths
-- Exponential backoff retry on 429 / 5xx responses (up to 4 attempts, capped at 16 s delay)
+- `robots.txt` compliance check on startup
+- Exponential backoff retry on 429 / 5xx responses (up to 4 attempts, capped at 16s delay)
 - Respects the `Retry-After` header when provided
 - 1-second polite delay between course page requests
 
-### Stage 3 — 3-Layer Extraction (`extractor.rs`)
+### Stage 3 — 4-Layer Extraction (`extractor.rs`)
 
 | Layer | Method | Why |
 |-------|--------|-----|
-| 1 | **JSON-LD** (`<script type="application/ld+json">`) | Universities embed Schema.org structured data for SEO — zero fragile selectors, survives layout redesigns |
-| 2 | **HTML selectors** (`scraper` crate) | Fills gaps not covered by JSON-LD; uses Coventry-specific CSS classes (`.c-key-info__label`, `.c-breadcrumb__item`, etc.) with generic fallbacks |
-| 3 | **Headless Chrome** (`chromiumoxide`, optional) | Renders JS-loaded content as a last resort |
+| 0 | **Full-text Regex** | Extracts from entire page text using patterns — most reliable for unstructured content |
+| 1 | **JSON-LD** | Universities embed Schema.org structured data for SEO — zero fragile selectors |
+| 2 | **HTML selectors** | Fills gaps not covered by other layers; uses Coventry-specific CSS classes |
+| 3 | **Headless Chrome** | Renders JS-loaded content as a last resort (optional feature) |
 
-**Score extraction** uses regular expressions rather than simple string searches, so patterns like `"IELTS overall score of 6.5"` or `"minimum IELTS 6.0"` are handled correctly. A 4-digit number guard prevents page year values (e.g. `2025`) from being mistaken for test scores.
+**Key improvements in final version:**
+- **PTE score validation** — Filters invalid scores (only accepts 36-90 range)
+- **Intake year filtering** — Only includes years >= 2025
+- **Field-specific keyword validation** — Prevents pollution (e.g., GRE field only populated when actually mentioned in test context)
+- **Document vs. requirement separation** — Distinguishes mandatory documents from academic requirements
+- **IELTS leakage prevention** — English scores only appear in English fields
 
-Any field not found at any layer is set to `"NA"` per spec.
+Any field not found at any layer is set to `"NA"` per specification.
 
 ### Stage 4 — Output (`schema.rs` + `main.rs`)
 
-`CourseData` is a typed Rust struct with `serde::Serialize`. It serialises directly to clean, validated JSON. A compile-time field-count check ensures `FIELD_COUNT` stays in sync with the struct definition.
+`CourseData` is a typed Rust struct with `serde::Serialize`. It serialises directly to clean, validated JSON.
 
 ---
 
